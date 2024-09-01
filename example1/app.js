@@ -8,12 +8,21 @@ import express from 'express'
 const app = express()
 
 import https from 'httpolyglot'
+import http from 'http'
 import fs from 'fs'
 import path from 'path'
 const __dirname = path.resolve()
 
 import { Server } from 'socket.io'
 import mediasoup from 'mediasoup'
+import fetch from 'node-fetch'; 
+
+const listenIp = '192.168.0.178';
+const remoteIp = '192.168.0.187'
+const localtransportport = 312321;
+const remotetransportport = 412412;
+
+
 
 app.get('*', (req, res, next) => {
   const path = '/sfu/'
@@ -25,18 +34,21 @@ app.get('*', (req, res, next) => {
 
 app.use('/sfu/:room', express.static(path.join(__dirname, 'public')))
 
-// SSL cert for HTTPS access
-const options = {
-  key: fs.readFileSync('./server/ssl/key.pem', 'utf-8'),
-  cert: fs.readFileSync('./server/ssl/cert.pem', 'utf-8')
-}
 
-const httpsServer = https.createServer(options, app)
-httpsServer.listen(3000, () => {
+
+
+// SSL cert for HTTPS access
+// const options = {
+//   key: fs.readFileSync('./server/ssl/key.pem', 'utf-8'),
+//   cert: fs.readFileSync('./server/ssl/cert.pem', 'utf-8')
+// }
+
+const httpServer = http.createServer(app)
+httpServer.listen(3000, () => {
   console.log('listening on port: ' + 3000)
 })
 
-const io = new Server(httpsServer)
+const io = new Server(httpServer)
 
 // socket.io namespace (could represent a room?)
 const connections = io.of('/mediasoup')
@@ -155,29 +167,86 @@ connections.on('connection', async socket => {
   })
 
   const createRoom = async (roomName, socketId) => {
-    // worker.createRouter(options)
-    // options = { mediaCodecs, appData }
-    // mediaCodecs -> defined above
-    // appData -> custom application data - we are not supplying any
-    // none of the two are required
-    let router1
-    let peers = []
+    let router1, pipeTransport;
+    let peers = [];
     if (rooms[roomName]) {
-      router1 = rooms[roomName].router
-      peers = rooms[roomName].peers || []
+      router1 = rooms[roomName].router;
+      pipeTransport = rooms[roomName].pipeTransport;
+      peers = rooms[roomName].peers || [];
+      console.log(`Room already exists. Router ID: ${router1.id}, PipeTransport ID: ${pipeTransport.id}`);
     } else {
-      router1 = await worker.createRouter({ mediaCodecs, })
+      router1 = await worker.createRouter({ mediaCodecs });
+      pipeTransport = await router1.createPipeTransport({ listenIp: listenIp, port: localtransportport });
+      console.log('Pipe transport Id is -->', pipeTransport.id);
+  
+      // Notify the remote server of the PipeTransport details
+      const response = await fetch(`http://${remoteIp}:3000/reportPipeAddress`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip: pipeTransport.tuple.localIp, port: pipeTransport.tuple.localPort })
+      });
+      const data = await response.json();
+      console.log('Pipe transport connection established with remote server:', data);
+  
+      // Connect to the remote server's PipeTransport using the received details
+      await pipeTransport.connect({ ip: data.ip, port: data.port });
+      console.log('Pipe connect to remote IP:', data.ip, 'remote port:', data.port);
     }
-    
-    console.log(`Router ID: ${router1.id}`, peers.length)
-
+    console.log('')
+  
     rooms[roomName] = {
       router: router1,
       peers: [...peers, socketId],
-    }
+      pipeTransport: pipeTransport,
+    };
+  
+    return router1;
+  };
+  
 
-    return router1
-  }
+  app.post('/reportRtpParameters', express.json(), async (req, res) => {
+    const { produceId, kind, rtpParameters } = req.body;
+    const roomName = 'Aman'; // This should be dynamically determined or provided
+  
+    console.log('Received RTP parameters from remote server:', produceId, kind, rtpParameters);
+  
+    const room = rooms[roomName];
+    if (room && room.pipeTransport) {
+      try {
+        // Produce on the local PipeTransport using the received RTP parameters
+        const pipeProducer = await room.pipeTransport.produce({
+          id: produceId, // Use the same ID as received to keep it consistent
+          kind: kind,
+          rtpParameters: rtpParameters
+        });
+        console.log('Pipe producer created on local server:', pipeProducer.id);
+
+  
+        // Store the new pipeProducer in the producers array
+        producers.push({
+          socketId: 'nnnnn', // No socket associated since this is inter-server
+          producer: pipeProducer,
+          roomName: roomName
+        });
+        
+        addProducer(pipeProducer , roomName);
+        if(pipeProducer.kind === 'video'){
+          socket.emit('new-producer', { producerId: pipeProducer.id })
+        }
+
+        
+  
+        res.json({ success: true, pipeProducerId: pipeProducer.id });
+  
+      } catch (error) {
+        console.error('Error creating pipe producer on local server:', error.message);
+        res.status(500).json({ error: error.message });
+      }
+    } else {
+      console.error('No PipeTransport found for room:', roomName);
+      res.status(404).json({ error: 'No PipeTransport found' });
+    }
+  });
 
   // socket.on('createRoom', async (callback) => {
   //   if (router === undefined) {
@@ -297,12 +366,33 @@ connections.on('connection', async socket => {
     // let all consumers to consume this producer
     producers.forEach(producerData => {
       if (producerData.socketId !== socketId && producerData.roomName === roomName) {
-        const producerSocket = peers[producerData.socketId].socket
-        // use socket to send producer id to producer
-        producerSocket.emit('new-producer', { producerId: id })
+        if(peers[producerData.socketId].socket){
+          const producerSocket = peers[producerData.socketId].socket
+          // use socket to send producer id to producer
+          producerSocket.emit('new-producer', { producerId: id })
+        }
+       
       }
     })
   }
+
+  const reportRtpParameters = async (produceId, kind, rtpParameters) => {
+    try {
+      const response = await fetch(`http://${remoteIp}:3000/reportRtpParameters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          produceId,
+          kind,
+          rtpParameters
+        })
+      });
+      const data = await response.json();
+      console.log('RTP parameters reported to remote server:', data);
+    } catch (error) {
+      console.error('Error reporting RTP parameters to remote server:', error.message);
+    }
+  };
 
   const getTransport = (socketId) => {
     const [producerTransport] = transports.filter(transport => transport.socketId === socketId && !transport.consumer)
@@ -328,8 +418,33 @@ connections.on('connection', async socket => {
     const { roomName } = peers[socket.id]
 
     addProducer(producer, roomName)
+       if(socket.id){
+        informConsumers(roomName, socket.id, producer.id)
+       }
+    
 
-    informConsumers(roomName, socket.id, producer.id)
+    const room = rooms[roomName];
+    if (room && room.pipeTransport) {
+        const remotePipeTransport = room.pipeTransport;
+        try {
+            // Correctly consume the producer via PipeTransport
+            const pipeConsumer = await remotePipeTransport.consume({
+                producerId: producer.id,
+                paused: true,
+                appData: { roomName: roomName }
+            });
+            console.log('Pipe consumer created:', pipeConsumer.id);
+
+            await reportRtpParameters(producer.id, producer.kind, producer.rtpParameters);
+
+            // Store pipeConsumer or handle it accordingly
+        } catch (error) {
+            console.error('Error creating pipe consumer:', error.message);
+        }
+    } else {
+        console.error('No PipeTransport found for room:', roomName);
+    }
+
 
     console.log('Producer ID: ', producer.id, producer.kind)
 
@@ -429,7 +544,7 @@ const createWebRtcTransport = async (router) => {
         listenIps: [
           {
             ip: '0.0.0.0', // replace with relevant IP address
-            announcedIp: '10.0.0.115',
+            announcedIp: '192.168.0.178',
           }
         ],
         enableUdp: true,
